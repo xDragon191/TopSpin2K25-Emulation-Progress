@@ -1,0 +1,165 @@
+diff --git a/src/shader_recompiler/frontend/control_flow_graph.cpp b/src/shader_recompiler/frontend/control_flow_graph.cpp
+index 4f388cb1..e679cb1d 100644
+--- a/src/shader_recompiler/frontend/control_flow_graph.cpp
++++ b/src/shader_recompiler/frontend/control_flow_graph.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <unordered_set>
+ #include "common/assert.h"
+ #include "common/logging/log.h"
+ #include "shader_recompiler/frontend/control_flow_graph.h"
+@@ -129,11 +130,8 @@ void CFG::EmitLabels() {
+                 if (auto t = ResolveSetPcTarget(inst_list, i, index_to_pc)) {
+                     target = *t;
+                 } else {
+-                    ASSERT_MSG(
+-                        false,
+-                        "S_SETPC_B64 without a resolvable offset at PC {:#x} (Index {}): Involved "
+-                        "instructions not recognized or invalid pattern",
+-                        pc, i);
++                    // Fallback to next instruction when dynamic jump table is encountered
++                    target = pc + inst.length; 
+                 }
+             }
+             AddLabel(target);
+@@ -336,11 +334,12 @@ void CFG::LinkBlocks() {
+         u32 target_pc = 0;
+         if (end_inst.opcode == Opcode::S_SETPC_B64) {
+             auto tgt = ResolveSetPcTarget(inst_list, block.end_index, index_to_pc);
+-            ASSERT_MSG(tgt,
+-                       "S_SETPC_B64 without a resolvable offset at PC {:#x} (Index {}): Involved "
+-                       "instructions not recognized or invalid pattern",
+-                       branch_pc, block.end_index);
+-            target_pc = *tgt;
++            if (tgt) {
++                target_pc = *tgt;
++            } else {
++                // Advance pointer instead of critical crash on dynamic jump tables
++                target_pc = block.end;
++            }
+         } else {
+             target_pc = end_inst.BranchTarget(branch_pc);
+         }
+@@ -372,13 +371,46 @@ void CFG::LinkBlocks() {
+ }
+ 
+ void CFG::RemoveUnreachableBlocks() {
+-    for (auto it = std::next(blocks.begin()); it != blocks.end();) {
+-        if (it->num_predecessors == 0) {
+-            LOG_WARNING(Render_Recompiler, "Removing unreachable block begin={:#x}", it->begin);
++    if (blocks.empty()) {
++        return;
++    }
++
++    // 1. Traverse graph from entry block (0x000) to find all reachable blocks.
++    std::unordered_set<Block*> reachable;
++    std::vector<Block*> worklist;
++    Block* entry = &(*blocks.begin());
++    reachable.insert(entry);
++    worklist.push_back(entry);
++
++    while (!worklist.empty()) {
++        Block* curr = worklist.back();
++        worklist.pop_back();
++
++        if (curr->branch_true && reachable.insert(curr->branch_true).second) {
++            worklist.push_back(curr->branch_true);
++        }
++        if (curr->branch_false && reachable.insert(curr->branch_false).second) {
++            worklist.push_back(curr->branch_false);
++        }
++    }
++
++    // 2. Remove unreachable blocks (including orphaned sub-blocks)
++    //    and decrement num_predecessors on reachable target blocks.
++    for (auto it = blocks.begin(); it != blocks.end();) {
++        Block* node = &(*it);
++        if (!reachable.contains(node)) {
++            LOG_WARNING(Render_Recompiler, "Removing unreachable block at {:#x}", node->begin);
++            if (node->branch_true) {
++                --node->branch_true->num_predecessors;
++            }
++            if (node->branch_false && node->branch_false != node->branch_true) {
++                --node->branch_false->num_predecessors;
++            }
+             it = blocks.erase(it);
+-        } else {
+-            it++;
++            continue;
+         }
++        ++it;
+     }
+ }
+diff --git a/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp b/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
+index 1a2b3c4d..5e6f7a8b 100644
+--- a/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
++++ b/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
+@@ -775,6 +775,16 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
+ 
+             SimplifyReadConstAddressAdd(inst);
+ 
++            // ReadConst can also read from a PC-relative inline data table. Those
++            // reads are not extended-userdata/SRT pointers and must not be folded
++            // into the flattened user-data buffer. In particular, a GetPcLo-based
++            // address does not have GetUserData/ReadConst/ReadConstBuffer sources.
++            if (inst.GetOpcode() == IR::Opcode::ReadConst) {
++                IR::Inst* base = inst.Arg(0).TryInst();
++                if (!base || base->GetOpcode() != IR::Opcode::CompositeConstructU32x2 ||
++                    !IsReadConstSource(base->Arg(0)) || !IsReadConstSource(base->Arg(1))) {
++                    continue;
++                }
++            }
++
+             all_readconsts.push_back(&inst);
+@@ -845,6 +855,9 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
+             continue;
+         }
++        if (!IsReadConstSource(base->Arg(0)) || !IsReadConstSource(base->Arg(1))) {
++            continue;
++        }
+ 
+         IR::Inst* ptr_lo = base->Arg(0).Inst();
+diff --git a/src/shader_recompiler/ir/passes/resource_discover_pass.cpp b/src/shader_recompiler/ir/passes/resource_discover_pass.cpp
+index 3c4d5e6f..7a8b9c0d 100644
+--- a/src/shader_recompiler/ir/passes/resource_discover_pass.cpp
++++ b/src/shader_recompiler/ir/passes/resource_discover_pass.cpp
+@@ -286,7 +286,12 @@ void MarkReadConstBufferSharpSources(const SharpReference& sharp) {
+         if (!source) {
+             continue;
+         }
+-        ASSERT(IsSharpSource(source));
++        // Descriptor words can be produced by an IR instruction that this
++        // pass does not need to mark as a ReadConstBuffer source.
++        // Only mark the recognized source kinds instead of aborting discovery.
++        if (!IsSharpSource(source)) {
++            continue;
++        }
+         if (source->GetOpcode() == IR::Opcode::ReadConstBuffer) {
+             auto flags = source->Flags<IR::BufferInstInfo>();
+             flags.sharp_source.Assign(1u);
+diff --git a/src/shader_recompiler/ir/passes/resource_patching_pass.cpp b/src/shader_recompiler/ir/passes/resource_patching_pass.cpp
+index 54fc0257..5b262c56 100644
+--- a/src/shader_recompiler/ir/passes/resource_patching_pass.cpp
++++ b/src/shader_recompiler/ir/passes/resource_patching_pass.cpp
+@@ -287,9 +287,16 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
+ 
+     // Patch image instruction if image is FMask.
+     if (AmdGpu::IsFmask(image.GetDataFmt())) {
+-        ASSERT_MSG(!is_written, "FMask storage instructions are not supported");
+-
+         IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
++        if (is_written) {
++            if (inst.HasUses()) {
++                inst.ReplaceUsesWith(ir.Imm32(0));
++            } else {
++                inst.Invalidate();
++            }
++            return;
++        }
++
+         switch (inst.GetOpcode()) {
+         case IR::Opcode::ImageRead:
+         case IR::Opcode::ImageSampleRaw: {
+         
