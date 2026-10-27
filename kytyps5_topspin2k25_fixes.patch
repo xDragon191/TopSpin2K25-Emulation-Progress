@@ -1,0 +1,70 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+index 4481d7f1..e0bc7af7 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+@@ -506,6 +506,74 @@ void TextureCache::RefreshCopySource(ImageId id) {
+ bool TextureCache::CopyD16(Image& destination, Image& source) {
+ 	const bool source_depth      = source.info.IsDepth();
+ 	const bool destination_depth = destination.info.IsDepth();
++	// TopSpin 2K25 can copy a D16 depth image into a D24S8 depth attachment.
++	// Reuse the existing D16 promotion compute path to encode the depth plane
++	// as D24 (or D32) before uploading it to the destination depth aspect.
++	if (source_depth && destination_depth) {
++		const auto source_transfer_bytes = DepthAspectTransferBytes(source.backing.format);
++		const auto destination_transfer_bytes = DepthAspectTransferBytes(destination.backing.format);
++		if (source_transfer_bytes != sizeof(uint16_t) ||
++		    destination_transfer_bytes != sizeof(uint32_t) ||
++		    source.info.bytes_per_block != sizeof(uint16_t) ||
++		    destination.info.bytes_per_block != sizeof(uint16_t)) {
++			return false;
++		}
++		const auto layers = source.info.resources.layers;
++		const uint64_t source_slice_size = static_cast<uint64_t>(source.info.pitch) *
++		                                   source.info.extent.height * source_transfer_bytes;
++		const uint64_t destination_slice_size = static_cast<uint64_t>(destination.info.pitch) *
++		                                        destination.info.extent.height * destination_transfer_bytes;
++		const auto source_size = source_slice_size * layers;
++		const auto destination_size = destination_slice_size * layers;
++
++		const std::array source_copies {
++		    vk::BufferImageCopy {0, source.info.pitch, source.info.extent.height,
++		                         {vk::ImageAspectFlagBits::eDepth, 0, 0, layers}, {}, source.info.extent}};
++		const std::array destination_copies {
++		    vk::BufferImageCopy {0, destination.info.pitch, destination.info.extent.height,
++		                         {vk::ImageAspectFlagBits::eDepth, 0, 0, layers}, {}, destination.info.extent}};
++
++		auto source_buffer = m_tiler.GetScratchBuffer(source_size);
++		auto destination_buffer = m_tiler.GetScratchBuffer(destination_size, source_buffer.buffer);
++		const TileManager::D16Layout layout {
++		    .width = source.info.extent.width,
++		    .height = source.info.extent.height,
++		    .layers = layers,
++		    .source_row_stride = static_cast<uint64_t>(source.info.pitch) * source_transfer_bytes,
++		    .target_row_stride = static_cast<uint64_t>(destination.info.pitch) * destination_transfer_bytes,
++		    .source_slice_stride = source_slice_size,
++		    .target_slice_stride = destination_slice_size,
++		};
++		source.Download(source_copies, source_buffer.buffer, source_buffer.offset, source_buffer.size);
++		m_tiler.ConvertD16(
++		    {source_buffer.buffer, source_buffer.offset, source_buffer.size},
++		    {destination_buffer.buffer, destination_buffer.offset, destination_buffer.size},
++		    TileManager::D16Direction::Promote,
++		    DepthAspectTransferFormat(destination.backing.format) == vk::Format::eD32Sfloat, layout);
++		destination.Upload(destination_copies, destination_buffer.buffer, destination_buffer.offset,
++		                   destination_buffer.size);
++		return true;
++	}
+ 	if (source_depth == destination_depth) {
+ 		return false;
+ 	}
+diff --git a/src/graphics/presentation/videoOut.cpp b/src/graphics/presentation/videoOut.cpp
+index 269d8f23..9c2dcb21 100644
+--- a/src/graphics/presentation/videoOut.cpp
++++ b/src/graphics/presentation/videoOut.cpp
+@@ -1874,8 +1874,10 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
+-	status->resolution =
+-	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
++	const bool force_non_4k = std::getenv("KYTY_OUTPUT_RES_1080") != nullptr;
++	const bool detect_non_4k =
++	    (attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160;
++	status->resolution = (force_non_4k || detect_non_4k) ? 1u : 2u;
