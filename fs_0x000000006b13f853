@@ -1,0 +1,43 @@
+Block: $0
+Block: $1
+If: cond = %95, body = $2, merge = $11
+Block: $2
+If: cond = %158, body = $3, merge = $4
+Block: $3
+EndIf: merge = $4
+Block: $4
+If: cond = %178, body = $5, merge = $6
+Block: $5
+EndIf: merge = $6
+Block: $6
+If: cond = %192, body = $7, merge = $8
+Block: $7
+EndIf: merge = $8
+Block: $8
+If: cond = %222, body = $9, merge = $10
+Block: $9
+EndIf: merge = $10
+Block: $10
+EndIf: merge = $11
+Block: $11
+If: cond = %272, body = $12, merge = $20
+Block: $12
+Block: $13
+If: cond = %350, body = $14, merge = $19
+Block: $14
+Block: $15
+If: cond = %425, body = $16, merge = $18
+Block: $16
+Block: $17
+EndIf: merge = $18
+Block: $18
+EndIf: merge = $19
+Block: $19
+EndIf: merge = $20
+Block: $20
+If: cond = %508, body = $21, merge = $22
+Block: $21
+EndIf: merge = $22
+Block: $22
+Block: $23
+Return
